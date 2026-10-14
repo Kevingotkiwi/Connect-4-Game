@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect 4 vs Neural Network</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #12151f; color: #e8eaf0; padding: 16px 12px 32px;
+  }
+  h1 { font-size: 1.5rem; margin: 8px 0 12px; text-align: center; }
+  #controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-bottom: 10px; }
+  label { font-size: 0.9rem; display: flex; align-items: center; gap: 6px; }
+  select, button {
+    font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid #3a4160;
+    background: #1c2133; color: inherit;
+  }
+  button { cursor: pointer; background: #3b5bdb; border-color: #3b5bdb; font-weight: 600; }
+  button:hover { background: #4c6ef5; }
+  #status { min-height: 1.6em; font-size: 1.1rem; font-weight: 600; margin: 6px 0 10px; text-align: center; }
+  canvas { max-width: 100%; touch-action: manipulation; cursor: pointer; }
+  #brain { font-size: 0.8rem; opacity: 0.7; margin-top: 12px; text-align: center; max-width: 520px; }
+  button.ghost { background: #1c2133; border-color: #3a4160; }
+  button.ghost:hover { background: #272e47; }
+  #bar { width: min(560px, 100%); height: 10px; border-radius: 6px; overflow: hidden; margin-top: 12px; }
+  #barFill { height: 100%; width: 50%; transition: width .4s; }
+  #barLabel, #score { font-size: 0.85rem; opacity: 0.8; margin-top: 6px; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>Connect 4 vs Neural Network</h1>
+  <div id="controls">
+    <label>Difficulty
+      <select id="level">
+        <option value="2">Easy</option>
+        <option value="4" selected>Medium</option>
+        <option value="6">Hard</option>
+      </select>
+    </label>
+    <label>You play
+      <select id="side">
+        <option value="1">First (red)</option>
+        <option value="-1">Second (yellow)</option>
+      </select>
+    </label>
+    <button id="newBtn">New game</button>
+    <button id="undoBtn" class="ghost">Undo</button>
+    <button id="hintBtn" class="ghost">Hint</button>
+    <button id="soundBtn" class="ghost">Sound: on</button>
+  </div>
+  <div id="status"></div>
+  <canvas id="c"></canvas>
+  <div id="bar"><div id="barFill"></div></div>
+  <div id="barLabel"></div>
+  <div id="score"></div>
+  <p id="brain"></p>
+
+  <script src="weights.js"></script>
+  <script>
+  // ENGINE START ------------------------------------------------------------
+  const ROWS = 6, COLS = 7, ORDER = [3, 2, 4, 1, 5, 0, 6];
+
+  let board = new Int8Array(ROWS * COLS);   // row 0 = top, index = r*COLS + c
+  let player = 1, winner = 0, moves = 0;
+  const hist = [];
+
+  // --- the trained ANN (same layout as the PyTorch model) ---
+  let NET = null;
+  if (typeof WEIGHTS !== "undefined") {
+    NET = {
+      w0: Float32Array.from(WEIGHTS.w0.flat()), b0: Float32Array.from(WEIGHTS.b0),
+      w1: Float32Array.from(WEIGHTS.w1.flat()), b1: Float32Array.from(WEIGHTS.b1),
+      w2: Float32Array.from(WEIGHTS.w2.flat()), b2: WEIGHTS.b2[0],
+    };
+  }
+  const inp = new Float32Array(84), h0 = new Float32Array(128), h1 = new Float32Array(64);
+
+  function netEval() {              // value for the player to move, in [-1, 1]
+    const n = ROWS * COLS;
+    for (let i = 0; i < n; i++) {
+      inp[i] = board[i] === player ? 1 : 0;
+      inp[n + i] = board[i] === -player ? 1 : 0;
+    }
+    for (let j = 0; j < 128; j++) {
+      let s = NET.b0[j]; const off = j * 84;
+      for (let i = 0; i < 84; i++) if (inp[i] !== 0) s += NET.w0[off + i];
+      h0[j] = s > 0 ? s : 0;
+    }
+    for (let j = 0; j < 64; j++) {
+      let s = NET.b1[j]; const off = j * 128;
+      for (let i = 0; i < 128; i++) s += NET.w1[off + i] * h0[i];
+      h1[j] = s > 0 ? s : 0;
+    }
+    let s = NET.b2;
+    for (let i = 0; i < 64; i++) s += NET.w2[i] * h1[i];
+    return Math.tanh(s);
+  }
+
+  // --- fallback evaluation used only when weights.js is missing ---
+  const WINDOWS = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++)
+    for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+      const er = r + 3 * dr, ec = c + 3 * dc;
+      if (er < 0 || er >= ROWS || ec < 0 || ec >= COLS) continue;
+      WINDOWS.push([0, 1, 2, 3].map(k => (r + k * dr) * COLS + c + k * dc));
+    }
+  function heuristicEval() {
+    let score = 0;
+    for (let r = 0; r < ROWS; r++) {
+      const v = board[r * COLS + 3];
+      if (v === player) score += 3; else if (v === -player) score -= 3;
+    }
+    const pts = [0, 1, 4, 20];
+    for (const w of WINDOWS) {
+      let mine = 0, theirs = 0;
+      for (const i of w) { if (board[i] === player) mine++; else if (board[i] === -player) theirs++; }
+      if (theirs === 0) score += pts[mine];
+      else if (mine === 0) score -= pts[theirs];
+    }
+    return Math.tanh(score / 40);
+  }
+  const evaluate = () => (NET ? netEval() : heuristicEval());
+
+  // --- game rules ---
+  const legal = () => ORDER.filter(c => board[c] === 0);
+
+  function dropRow(col) {
+    for (let r = ROWS - 1; r >= 0; r--) if (board[r * COLS + col] === 0) return r;
+    return -1;
+  }
+  function winCells(r, c) {
+    const p = board[r * COLS + c], all = new Set();
+    for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+      const cells = [r * COLS + c];
+      for (const s of [1, -1]) {
+        let rr = r + s * dr, cc = c + s * dc;
+        while (rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS && board[rr * COLS + cc] === p) {
+          cells.push(rr * COLS + cc); rr += s * dr; cc += s * dc;
+        }
+      }
+      if (cells.length >= 4) cells.forEach(i => all.add(i));   // keep every winning line
+    }
+    return all.size ? [...all] : null;
+  }
+  function place(col) {
+    const r = dropRow(col);
+    board[r * COLS + col] = player;
+    hist.push(r * COLS + col);
+    if (winCells(r, col)) winner = player;
+    player = -player; moves++;
+    return r;
+  }
+  function undo() {
+    board[hist.pop()] = 0;
+    player = -player; moves--; winner = 0;
+  }
+
+  // --- search: negamax + alpha-beta, ANN at the leaves ---
+  function negamax(depth, alpha, beta) {
+    if (winner !== 0) return -1 - 0.01 * depth;
+    if (moves === ROWS * COLS) return 0;
+    if (depth === 0) return evaluate();
+    let best = -2;
+    for (const c of legal()) {
+      place(c);
+      const s = -negamax(depth - 1, -beta, -alpha);
+      undo();
+      if (s > best) best = s;
+      if (best > alpha) alpha = best;
+      if (alpha >= beta) break;
+    }
+    return best;
+  }
+  function bestMove(depth) {
+    let cols = [], bestScore = -3;
+    for (const c of legal()) {
+      place(c);
+      const s = -negamax(depth - 1, -2, 2);
+      undo();
+      if (s > bestScore + 1e-9) { bestScore = s; cols = [c]; }
+      else if (Math.abs(s - bestScore) <= 1e-9) cols.push(c);
+    }
+    return cols[Math.floor(Math.random() * cols.length)];
+  }
+  // ENGINE END --------------------------------------------------------------
+
+  // ---------------------------------------------------------------- UI
+  const RED = "#e63946", YELLOW = "#ffd166";
+  const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const levelEl = document.getElementById("level"), sideEl = document.getElementById("side");
+
+  let human = 1, busy = false, hoverCol = -1, anim = null, winLine = null, over = false;
+  let cell = 80;
+
+  document.getElementById("brain").textContent = NET
+    ? "Brain: your trained neural network, running in your browser."
+    : "Brain: weights.js not found, so a simple built-in evaluation is used. " +
+      "Run export_weights.py and put weights.js next to this file to use your trained network.";
+
+  function colorOf(p) { return p === 1 ? RED : YELLOW; }
+  function setStatus(t) { statusEl.textContent = t; }
+
+  const $ = id => document.getElementById(id);
+  let hintCol = -1, soundOn = true, audio = null;
+  const score = { w: 0, l: 0, d: 0 };
+  try { Object.assign(score, JSON.parse(localStorage.getItem("c4score") || "{}")); } catch (e) {}
+
+  function showScore() {
+    $("score").textContent = "You " + score.w + " \u2013 " + score.l + " Computer \u00b7 draws " + score.d;
+    try { localStorage.setItem("c4score", JSON.stringify(score)); } catch (e) {}
+  }
+  function beep(freq, dur, type) {
+    if (!soundOn) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audio.createOscillator(), g = audio.createGain(), t = audio.currentTime;
+      o.type = type || "sine"; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.08, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(audio.destination); o.start(t); o.stop(t + dur);
+    } catch (e) {}
+  }
+  function updateBar() {            // the network's own opinion of the position
+    let p;
+    if (winner) p = winner === human ? 1 : 0;
+    else if (moves === ROWS * COLS) p = 0.5;
+    else { const e = evaluate(); p = ((player === human ? e : -e) + 1) / 2; }
+    $("bar").style.background = colorOf(-human);
+    $("barFill").style.background = colorOf(human);
+    $("barFill").style.width = Math.round(p * 100) + "%";
+    $("barLabel").textContent = (NET ? "Network" : "Evaluation") + " says your winning chances: " + Math.round(p * 100) + "%";
+  }
+
+  function resize() {
+    const w = Math.min(560, window.innerWidth - 24);
+    cell = w / COLS;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = w + "px";
+    canvas.style.height = cell * (ROWS + 1) + "px";
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(cell * (ROWS + 1) * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  const cx = c => (c + 0.5) * cell;
+  const cy = r => (r + 1.5) * cell;
+
+  function disc(x, y, color, ring) {
+    ctx.beginPath(); ctx.arc(x, y, cell * 0.4, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+    if (ring) { ctx.lineWidth = 4; ctx.strokeStyle = "#fff"; ctx.stroke(); }
+  }
+
+  function draw(now) {
+    ctx.clearRect(0, 0, cell * COLS, cell * (ROWS + 1));
+
+    // hover preview
+    if (!busy && !over && hoverCol >= 0 && player === human && board[hoverCol] === 0) {
+      ctx.globalAlpha = 0.6; disc(cx(hoverCol), cell * 0.5, colorOf(human)); ctx.globalAlpha = 1;
+    }
+
+    // hint arrow
+    if (hintCol >= 0) {
+      const bob = 4 * Math.sin(now / 120);
+      ctx.fillStyle = "#7cfc98";
+      ctx.beginPath();
+      ctx.moveTo(cx(hintCol) - cell * 0.22, cell * 0.25 + bob);
+      ctx.lineTo(cx(hintCol) + cell * 0.22, cell * 0.25 + bob);
+      ctx.lineTo(cx(hintCol), cell * 0.7 + bob);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // discs (behind the board)
+    const pulse = 0.5 + 0.5 * Math.sin(now / 150);
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c, v = board[i];
+      if (!v || (anim && anim.idx === i)) continue;
+      disc(cx(c), cy(r), colorOf(v), false);
+    }
+    if (anim) {
+      const p = Math.min(1, (now - anim.t0) / anim.dur);
+      const y = cell * 0.5 + (cy(anim.row) - cell * 0.5) * p * p;
+      disc(cx(anim.col), y, anim.color, false);
+      if (p >= 1) { const done = anim.onDone; anim = null; done(); }
+    }
+
+    // blue board with round holes
+    ctx.beginPath();
+    ctx.rect(0, cell, cell * COLS, cell * ROWS);
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      ctx.moveTo(cx(c) + cell * 0.4, cy(r));
+      ctx.arc(cx(c), cy(r), cell * 0.4, 0, Math.PI * 2, true);
+    }
+    ctx.fillStyle = "#2748c9"; ctx.fill("evenodd");
+
+    // winning four
+    if (winLine) {
+      ctx.lineWidth = 3 + 3 * pulse; ctx.strokeStyle = "#fff";
+      for (const i of winLine) {
+        ctx.beginPath();
+        ctx.arc(cx(i % COLS), cy(Math.floor(i / COLS)), cell * 0.4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    requestAnimationFrame(draw);
+  }
+
+  function startMove(col) {
+    const color = player;
+    hintCol = -1;
+    winLine = null;
+    const r = place(col);
+    if (winner) winLine = winCells(r, col);
+    anim = {
+      idx: r * COLS + col, col, row: r, color, t0: performance.now(),
+      dur: 160 * Math.sqrt(r + 1), onDone: afterMove,
+    };
+  }
+
+  function afterMove() {
+    updateBar();
+    if (!winner) beep(320, 0.07, "triangle");
+    if (winner) {
+      over = true; busy = false;
+      if (winner === human) {
+        score.w++; setStatus("You win! \uD83C\uDF89");
+        beep(660, 0.15); setTimeout(() => beep(880, 0.25), 150);
+      } else {
+        score.l++; setStatus("The computer wins."); beep(200, 0.4, "sawtooth");
+      }
+      showScore();
+    } else if (moves === ROWS * COLS) {
+      over = true; busy = false; score.d++; showScore(); setStatus("It's a draw.");
+    } else if (player === human) {
+      busy = false; setStatus("Your turn");
+    } else {
+      aiTurn();
+    }
+  }
+
+  function aiTurn() {
+    busy = true; setStatus("Computer is thinking\u2026");
+    setTimeout(() => { startMove(bestMove(parseInt(levelEl.value, 10))); }, 60);
+  }
+
+  function newGame() {
+    board.fill(0); hist.length = 0;
+    player = 1; winner = 0; moves = 0;
+    winLine = null; over = false; anim = null; hintCol = -1;
+    human = parseInt(sideEl.value, 10);
+    if (human === 1) { busy = false; setStatus("Your turn (red)"); updateBar(); }
+    else { aiTurn(); }
+  }
+
+  function colFromEvent(e) {
+    const rect = canvas.getBoundingClientRect();
+    return Math.floor((e.clientX - rect.left) / (rect.width / COLS));
+  }
+  canvas.addEventListener("pointermove", e => { hoverCol = colFromEvent(e); });
+  canvas.addEventListener("pointerleave", () => { hoverCol = -1; });
+  canvas.addEventListener("pointerdown", e => {
+    const col = colFromEvent(e);
+    hoverCol = col;
+    humanPlay(col);
+  });
+  function humanPlay(col) {
+    if (busy || over || anim || player !== human || col < 0 || col >= COLS || board[col] !== 0) return;
+    busy = true;
+    startMove(col);
+  }
+  function undoTurn() {             // takes back your move and the computer's reply
+    if (busy || anim || over) return;
+    if (hist.length - 2 < (human === 1 ? 0 : 1)) return;
+    undo(); undo(); hintCol = -1;
+    setStatus("Your turn"); updateBar();
+  }
+  function hint() {
+    if (busy || over || anim || player !== human) return;
+    busy = true; setStatus("Thinking of a hint\u2026");
+    setTimeout(() => { hintCol = bestMove(4); busy = false; setStatus("Hint: try the green arrow"); }, 40);
+  }
+
+  $("newBtn").addEventListener("click", newGame);
+  $("undoBtn").addEventListener("click", undoTurn);
+  $("hintBtn").addEventListener("click", hint);
+  $("soundBtn").addEventListener("click", () => {
+    soundOn = !soundOn; $("soundBtn").textContent = "Sound: " + (soundOn ? "on" : "off");
+  });
+  window.addEventListener("keydown", e => {
+    if (e.key >= "1" && e.key <= "7") humanPlay(parseInt(e.key, 10) - 1);
+    else if (e.key === "u" || e.key === "U") undoTurn();
+    else if (e.key === "h" || e.key === "H") hint();
+  });
+  showScore();
+  sideEl.addEventListener("change", newGame);
+  window.addEventListener("resize", resize);
+
+  resize();
+  requestAnimationFrame(draw);
+  newGame();
+  </script>
+</body>
+</html>
